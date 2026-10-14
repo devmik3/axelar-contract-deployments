@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# No authentication or services need restoring. Dependencies live in the snapshot.
+# Never initialize wallets or run deployment commands during orb activation.

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+repo_root="$PWD"
+export CI=true
+TIMEFORMAT='Completed in %3R seconds'
+
+echo 'Checking native build prerequisites'
+missing=()
+for package in build-essential pkg-config libssl-dev libudev-dev libusb-1.0-0-dev; do
+    if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    time sudo apt-get update -qq
+    time sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+fi
+
+# Match CI's Node 24 line, using a fixed, checksum-verified release.
+node_version=24.21.0
+node_home="$HOME/.local/share/axelar-orb/node-v${node_version}"
+if [[ ! -x "$node_home/bin/node" ]]; then
+    echo "Installing Node $node_version"
+    case "$(uname -m)" in
+        x86_64) arch=x64 ;;
+        aarch64) arch=arm64 ;;
+        *) echo 'Unsupported Node architecture' >&2; exit 1 ;;
+    esac
+    archive="node-v${node_version}-linux-${arch}.tar.xz"
+    download=$(mktemp -d)
+    trap 'rm -rf "$download"' EXIT
+    time curl -fsSL "https://nodejs.org/dist/v${node_version}/${archive}" -o "$download/$archive"
+    curl -fsSL "https://nodejs.org/dist/v${node_version}/SHASUMS256.txt" -o "$download/SHASUMS256.txt"
+    (cd "$download"; grep "  ${archive}$" SHASUMS256.txt | sha256sum -c -)
+    mkdir -p "$node_home"
+    tar -xJf "$download/$archive" -C "$node_home" --strip-components=1
+    rm -rf "$download"
+    trap - EXIT
+fi
+export PATH="$node_home/bin:$HOME/.cargo/bin:$PATH"
+
+# Login shells used by Amp must get the same tools as setup.
+profile_marker='# Axelar orb toolchains'
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >> "$HOME/.bash_profile" <<EOF
+
+$profile_marker
+if [[ "\$PWD" == "$repo_root" || "\$PWD" == "$repo_root/"* ]]; then
+    export PATH="$node_home/bin:\$HOME/.cargo/bin:$repo_root/node_modules/.bin:\$PATH"
+fi
+EOF
+fi
+
+echo 'Installing the repository-pinned Rust toolchain'
+if ! command -v rustup >/dev/null; then
+    installer=$(mktemp)
+    trap 'rm -f "$installer"' EXIT
+    curl -fsSL https://sh.rustup.rs -o "$installer"
+    time sh "$installer" -y --profile minimal --default-toolchain none --no-modify-path
+    rm -f "$installer"
+    trap - EXIT
+fi
+rust_version=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+time rustup toolchain install "$rust_version" --profile minimal --component rustfmt --component clippy
+
+echo 'Checking locked npm dependencies (including development tools)'
+# npm ci reinstalls even an unchanged tree (26 seconds on a warm orb).
+# Store the key inside node_modules so deleting dependencies invalidates it.
+for directory in . axelar-chains-config; do
+    key=$({
+        node --version
+        npm --version
+        sha256sum "$directory/package.json" "$directory/package-lock.json" .npmrc axelar-chains-config/package.json
+    } | sha256sum | cut -d ' ' -f 1)
+    marker="$directory/node_modules/.amp-install-key"
+    if [[ ! -f "$directory/node_modules/.package-lock.json" || "$(cat "$marker" 2>/dev/null || true)" != "$key" ]]; then
+        time npm ci --prefix "$directory" --include=dev --no-fund
+        printf '%s\n' "$key" > "$marker"
+    else
+        echo "Reusing $directory/node_modules"
+    fi
+done
+
+echo 'Caching locked Solana Rust dependencies (no compilation or deployment)'
+time cargo fetch --locked --manifest-path solana/Cargo.toml
+
+echo 'Building the root TypeScript package'
+time npm run build
+echo 'Orb setup finished; blockchain networks and wallets are not initialized.'
